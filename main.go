@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -35,6 +36,19 @@ func main() {
 
 	flag.Parse()
 
+	if *netInfo {
+		logger, err := setupLogging(*logFile, *logLevel, *verbose, *quiet)
+		if err != nil {
+			fmt.Printf("Error setting up logging: %v\n", err)
+			os.Exit(1)
+		}
+		defer logger.Close()
+
+		wol_network.SetLogger(logger)
+		handleNetworkInfo(logger)
+		return
+	}
+
 	if *help {
 		showHelp()
 		return
@@ -68,7 +82,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Println("Error: MAC address is required")
+		fmt.Println("Error: Command or MAC address is required")
 		fmt.Println()
 		showUsage()
 		os.Exit(1)
@@ -90,7 +104,7 @@ func main() {
 			fmt.Println("Error: Device name or MAC address required for wake command")
 			os.Exit(1)
 		}
-		handleWake(args[1], *port, deviceStore, logger)
+		handleWake(args[1], *port, deviceStore, logger, *verify, *verifyCapture, *verifyPing)
 	case "verify-network", "net-info":
 		handleNetworkInfo(logger)
 	case "test-broadcast":
@@ -101,11 +115,10 @@ func main() {
 		handleTestBroadcast(args[1], *port, logger)
 	default:
 		// Assume it's a device name or MAC address for wake-up
-		handleWake(command, *port, deviceStore, logger)
+		handleWake(command, *port, deviceStore, logger, *verify, *verifyCapture, *verifyPing)
 	}
 }
 
-// Add these functions to main.go:
 func handleNetworkInfo(logger *wol_log.Logger) {
 	fmt.Println("Network Information")
 	fmt.Println("==================")
@@ -166,7 +179,91 @@ func handleTestBroadcast(mac string, port int, logger *wol_log.Logger) {
 	}
 }
 
-// Update the handleWake function to support verification:
+func handleWake(target string, port int, store *wol_device.DeviceStore, logger *wol_log.Logger, verify, verifyCapture, verifyPing bool) {
+	var macAddress string
+	var deviceName string
+
+	// Check if target is a device name
+	if store.DeviceExists(target) {
+		device, err := store.GetDevice(target)
+		if err != nil {
+			fmt.Printf("Error: Failed to get device %s: %v\n", target, err)
+			os.Exit(1)
+		}
+
+		macAddress = device.MACAddress
+		deviceName = device.Name
+
+		// Use device's configured port if not overridden
+		if port == wol_network.DefaultWoLPort && device.Port != wol_network.DefaultWoLPort {
+			port = device.Port
+		}
+
+		logger.Info("Waking device by name: %s (MAC: %s)", deviceName, macAddress)
+	} else {
+		// Assume it's a MAC address
+		if err := wol_packet.ValidateMAC(target); err != nil {
+			fmt.Printf("Error: '%s' is not a valid device name or MAC address\n", target)
+			fmt.Printf("MAC validation error: %v\n", err)
+			fmt.Println("Use 'wol-server list-devices' to see available devices.")
+			logger.Error("Invalid target %s: %v", target, err)
+			os.Exit(1)
+		}
+
+		macAddress = target
+		deviceName = "Unknown Device"
+		logger.Info("Waking device by MAC: %s", macAddress)
+	}
+
+	// Send the Wake-on-LAN packet with or without verification
+	fmt.Printf("Sending Wake-on-LAN packet to %s (%s) on port %d...\n", deviceName, macAddress, port)
+
+	if verify || verifyCapture || verifyPing {
+		config := wol_network.VerificationConfig{
+			EnableCapture:  verifyCapture,
+			CaptureTimeout: 3 * time.Second,
+			EnablePing:     verifyPing,
+			PingTimeout:    2 * time.Second,
+		}
+
+		result, err := wol_network.SendWakeOnLANWithVerification(macAddress, port, config)
+		if err != nil {
+			fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Show verification results
+		if verifyCapture {
+			if result.PacketCaptured {
+				fmt.Println("✓ Packet verified on network")
+			} else {
+				fmt.Println("⚠ Packet not detected on network")
+			}
+		}
+
+		if verifyPing && result.TargetReachable {
+			fmt.Println("✓ Target appears reachable")
+		}
+
+	} else {
+		err := wol_network.SendWakeOnLAN(macAddress, port)
+		if err != nil {
+			fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Update last woken time if it's a known device
+	if store.DeviceExists(target) {
+		err := store.UpdateLastWoken(target)
+		if err != nil {
+			logger.Warn("Failed to update last woken time for %s: %v", target, err)
+		}
+	}
+
+	fmt.Printf("✓ Wake-on-LAN packet sent successfully to %s\n", deviceName)
+	logger.Info("Wake-on-LAN completed successfully for %s", deviceName)
+}
 
 func runServer(deviceStore *wol_device.DeviceStore, logger *wol_log.Logger, host string, port int, cors bool) {
 	wol_network.SetLogger(logger)
@@ -220,7 +317,7 @@ func handleAddDevice(args []string, store *wol_device.DeviceStore, logger *wol_l
 	err := store.AddDevice(name, macAddress, description, ipAddress, port)
 	if err != nil {
 		fmt.Printf("Error: Failed to add device: %v\n", err)
-		logger.Error("Failed to add device %s: %v\n", name, err)
+		logger.Error("Failed to add device %s: %v", name, err)
 		os.Exit(1)
 	}
 
@@ -335,92 +432,6 @@ func handleShowDevice(args []string, store *wol_device.DeviceStore, logger *wol_
 	logger.Debug("Showed device details for %s", name)
 }
 
-func handleWake(target string, port int, store *wol_device.DeviceStore, logger *wol_log.Logger) {
-	var macAddress string
-	var deviceName string
-
-	// Check if target is a device name
-	if store.DeviceExists(target) {
-		device, err := store.GetDevice(target)
-		if err != nil {
-			fmt.Printf("Error: Failed to get device %s: %v\n", target, err)
-			os.Exit(1)
-		}
-
-		macAddress = device.MACAddress
-		deviceName = device.Name
-
-		// Use device's configured port if not overridden
-		if port == wol_network.DefaultWoLPort && device.Port != wol_network.DefaultWoLPort {
-			port = device.Port
-		}
-
-		logger.Info("Waking device by name: %s (MAC: %s)", deviceName, macAddress)
-	} else {
-		// Assume it's a MAC address
-		if err := wol_packet.ValidateMAC(target); err != nil {
-			fmt.Printf("Error: '%s' is not a valid device name or MAC address\n", target)
-			fmt.Printf("MAC validation error: %v\n", err)
-			fmt.Println("Use 'wol-server list-devices' to see available devices.")
-			logger.Error("Invalid target %s: %v", target, err)
-			os.Exit(1)
-		}
-
-		macAddress = target
-		deviceName = "Unknown Device"
-		logger.Info("Waking device by MAC: %s", macAddress)
-	}
-
-	// Send the Wake-on-LAN packet with or without verification
-	fmt.Printf("Sending Wake-on-LAN packet to %s (%s) on port %d...\n", deviceName, macAddress, port)
-
-	if *verify || *verifyCapture || *verifyPing {
-		config := wol_network.VerificationConfig{
-			EnableCapture:  *verifyCapture,
-			CaptureTimeout: 3 * time.Second,
-			EnablePing:     *verifyPing,
-			PingTimeout:    2 * time.Second,
-		}
-
-		result, err := wol_network.SendWakeOnLANWithVerification(macAddress, port, config)
-		if err != nil {
-			fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Show verification results
-		if *verifyCapture {
-			if result.PacketCaptured {
-				fmt.Println("✓ Packet verified on network")
-			} else {
-				fmt.Println("⚠ Packet not detected on network")
-			}
-		}
-
-		if *verifyPing && result.TargetReachable {
-			fmt.Println("✓ Target appears reachable")
-		}
-
-	} else {
-		err := wol_network.SendWakeOnLAN(macAddress, port)
-		if err != nil {
-			fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	// Update last woken time if it's a known device
-	if store.DeviceExists(target) {
-		err := store.UpdateLastWoken(target)
-		if err != nil {
-			logger.Warn("Failed to update last woken time for %s: %v", target, err)
-		}
-	}
-
-	fmt.Printf("✓ Wake-on-LAN packet sent successfully to %s\n", deviceName)
-	logger.Info("Wake-on-LAN completed successfully for %s", deviceName)
-}
-
 func setupLogging(logFile, logLevel string, verbose, quiet bool) (*wol_log.Logger, error) {
 	var level wol_log.LogLevel
 
@@ -497,6 +508,16 @@ func showHelp() {
 	fmt.Println("  test-broadcast <mac>")
 	fmt.Println("        Test broadcast capability with packet verification")
 	fmt.Println()
+	fmt.Println("Server Mode:")
+	fmt.Println("  -server")
+	fmt.Println("        Run in HTTP server mode")
+	fmt.Println("  -server-port int")
+	fmt.Println("        Server port (default: 8080)")
+	fmt.Println("  -server-host string")
+	fmt.Println("        Server host (default: 0.0.0.0)")
+	fmt.Println("  -cors")
+	fmt.Println("        Enable CORS headers (default: true)")
+	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  -port int")
 	fmt.Printf("        UDP port to send Wake-on-LAN packet (default: %d)\n", wol_network.DefaultWoLPort)
@@ -526,6 +547,15 @@ func showHelp() {
 	fmt.Println("  wol-server.exe AA:BB:CC:DD:EE:FF")
 	fmt.Println("  wol-server.exe -port 7 laptop")
 	fmt.Println()
+	fmt.Println("  # Network verification")
+	fmt.Println("  wol-server.exe verify-network")
+	fmt.Println("  wol-server.exe test-broadcast AA:BB:CC:DD:EE:FF")
+	fmt.Println("  wol-server.exe -verify-capture desktop")
+	fmt.Println()
+	fmt.Println("  # Server mode")
+	fmt.Println("  wol-server.exe -server")
+	fmt.Println("  wol-server.exe -server -server-port 8080 -log server.log")
+	fmt.Println()
 	fmt.Println("Supported MAC address formats:")
 	fmt.Println("  - Colon separated: AA:BB:CC:DD:EE:FF")
 	fmt.Println("  - Hyphen separated: AA-BB-CC-DD-EE-FF")
@@ -537,4 +567,5 @@ func showUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  wol-server.exe [options] <command> [arguments]")
 	fmt.Println("  wol-server.exe [options] <device-name-or-mac>")
+	fmt.Println("  wol-server.exe -server [server-options]")
 }
