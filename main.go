@@ -16,17 +16,21 @@ import (
 
 func main() {
 	var (
-		port       = flag.Int("port", wol_network.DefaultWoLPort, "UDP port to send Wake-on-LAN packet (default: 9)")
-		help       = flag.Bool("help", false, "Show help message")
-		logFile    = flag.String("log", "", "Log file path (default: console only)")
-		logLevel   = flag.String("level", "info", "Log level: debug, info, warn, error")
-		verbose    = flag.Bool("verbose", false, "Enable verbose output (same as -level debug)")
-		quiet      = flag.Bool("quiet", false, "Quiet mode - only errors (same as -level error)")
-		configPath = flag.String("config", "", "Device configuration file path (default: system config directory)")
-		serverMode = flag.Bool("server", false, "Run in server mode")
-		serverPort = flag.Int("server-port", 8080, "Server port (default: 8080)")
-		serverHost = flag.String("server-host", "0.0.0.0", "Server host (default: 0.0.0.0)")
-		enableCORS = flag.Bool("cors", true, "Enable CORS headers (default: true)")
+		port          = flag.Int("port", wol_network.DefaultWoLPort, "UDP port to send Wake-on-LAN packet (default: 9)")
+		help          = flag.Bool("help", false, "Show help message")
+		logFile       = flag.String("log", "", "Log file path (default: console only)")
+		logLevel      = flag.String("level", "info", "Log level: debug, info, warn, error")
+		verbose       = flag.Bool("verbose", false, "Enable verbose output (same as -level debug)")
+		quiet         = flag.Bool("quiet", false, "Quiet mode - only errors (same as -level error)")
+		configPath    = flag.String("config", "", "Device configuration file path (default: system config directory)")
+		serverMode    = flag.Bool("server", false, "Run in server mode")
+		serverPort    = flag.Int("server-port", 8080, "Server port (default: 8080)")
+		serverHost    = flag.String("server-host", "0.0.0.0", "Server host (default: 0.0.0.0)")
+		enableCORS    = flag.Bool("cors", true, "Enable CORS headers (default: true)")
+		verify        = flag.Bool("verify", false, "Enable packet verification")
+		verifyCapture = flag.Bool("verify-capture", false, "Enable packet capture verification")
+		verifyPing    = flag.Bool("verify-ping", false, "Enable ping verification after wake")
+		netInfo       = flag.Bool("net-info", false, "Show network information and exit")
 	)
 
 	flag.Parse()
@@ -87,11 +91,82 @@ func main() {
 			os.Exit(1)
 		}
 		handleWake(args[1], *port, deviceStore, logger)
+	case "verify-network", "net-info":
+		handleNetworkInfo(logger)
+	case "test-broadcast":
+		if len(args) < 2 {
+			fmt.Println("Usage: wol-server test-broadcast <MAC-address>")
+			os.Exit(1)
+		}
+		handleTestBroadcast(args[1], *port, logger)
 	default:
 		// Assume it's a device name or MAC address for wake-up
 		handleWake(command, *port, deviceStore, logger)
 	}
 }
+
+// Add these functions to main.go:
+func handleNetworkInfo(logger *wol_log.Logger) {
+	fmt.Println("Network Information")
+	fmt.Println("==================")
+
+	netInfo, err := wol_network.VerifyNetworkConnectivity()
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		logger.Error("Network verification failed: %v", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Interface:    %s\n", netInfo.InterfaceName)
+	fmt.Printf("Local IP:     %s\n", netInfo.LocalIP)
+	fmt.Printf("Broadcast IP: %s\n", netInfo.BroadcastIP)
+	fmt.Printf("MAC Address:  %s\n", netInfo.MACAddress)
+	fmt.Println()
+	fmt.Println("✓ Network connectivity verified")
+	fmt.Println("✓ UDP broadcast capability confirmed")
+
+	logger.Info("Network information displayed successfully")
+}
+
+func handleTestBroadcast(mac string, port int, logger *wol_log.Logger) {
+	fmt.Printf("Testing broadcast to %s on port %d...\n", mac, port)
+
+	config := wol_network.VerificationConfig{
+		EnableCapture:  true,
+		CaptureTimeout: 5 * time.Second,
+		EnablePing:     false,
+	}
+
+	result, err := wol_network.SendWakeOnLANWithVerification(mac, port, config)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("\nVerification Results:")
+	fmt.Println("====================")
+	fmt.Printf("Packet Sent:      %v\n", result.PacketSent)
+	fmt.Printf("Broadcast Sent:   %v\n", result.BroadcastSent)
+	fmt.Printf("Packet Captured:  %v\n", result.PacketCaptured)
+	fmt.Printf("Capture Details:  %s\n", result.CaptureDetails)
+
+	if result.NetworkInfo.LocalIP != "" {
+		fmt.Printf("Local IP:         %s\n", result.NetworkInfo.LocalIP)
+		fmt.Printf("Broadcast IP:     %s\n", result.NetworkInfo.BroadcastIP)
+		fmt.Printf("Interface:        %s\n", result.NetworkInfo.InterfaceName)
+	}
+
+	if result.PacketSent && result.PacketCaptured {
+		fmt.Println("\n✓ Wake-on-LAN packet successfully sent and verified on network")
+	} else if result.PacketSent {
+		fmt.Println("\n⚠ Wake-on-LAN packet sent but not verified on network")
+		fmt.Println("  This could be normal depending on network configuration")
+	} else {
+		fmt.Println("\n✗ Failed to send Wake-on-LAN packet")
+	}
+}
+
+// Update the handleWake function to support verification:
 
 func runServer(deviceStore *wol_device.DeviceStore, logger *wol_log.Logger, host string, port int, cors bool) {
 	wol_network.SetLogger(logger)
@@ -296,18 +371,47 @@ func handleWake(target string, port int, store *wol_device.DeviceStore, logger *
 		logger.Info("Waking device by MAC: %s", macAddress)
 	}
 
-	// Send the Wake-on-LAN packet
+	// Send the Wake-on-LAN packet with or without verification
 	fmt.Printf("Sending Wake-on-LAN packet to %s (%s) on port %d...\n", deviceName, macAddress, port)
 
-	err := wol_network.SendWakeOnLAN(macAddress, port)
-	if err != nil {
-		fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
-		os.Exit(1)
+	if *verify || *verifyCapture || *verifyPing {
+		config := wol_network.VerificationConfig{
+			EnableCapture:  *verifyCapture,
+			CaptureTimeout: 3 * time.Second,
+			EnablePing:     *verifyPing,
+			PingTimeout:    2 * time.Second,
+		}
+
+		result, err := wol_network.SendWakeOnLANWithVerification(macAddress, port, config)
+		if err != nil {
+			fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Show verification results
+		if *verifyCapture {
+			if result.PacketCaptured {
+				fmt.Println("✓ Packet verified on network")
+			} else {
+				fmt.Println("⚠ Packet not detected on network")
+			}
+		}
+
+		if *verifyPing && result.TargetReachable {
+			fmt.Println("✓ Target appears reachable")
+		}
+
+	} else {
+		err := wol_network.SendWakeOnLAN(macAddress, port)
+		if err != nil {
+			fmt.Printf("Error: Failed to send Wake-on-LAN packet: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Update last woken time if it's a known device
 	if store.DeviceExists(target) {
-		err = store.UpdateLastWoken(target)
+		err := store.UpdateLastWoken(target)
 		if err != nil {
 			logger.Warn("Failed to update last woken time for %s: %v", target, err)
 		}
@@ -378,6 +482,20 @@ func showHelp() {
 	fmt.Println("        Wake a device by name or MAC address")
 	fmt.Println("  <name-or-mac>")
 	fmt.Println("        Wake a device (shorthand)")
+	fmt.Println()
+	fmt.Println("Verification Options:")
+	fmt.Println("  -verify")
+	fmt.Println("        Enable basic packet verification")
+	fmt.Println("  -verify-capture")
+	fmt.Println("        Enable packet capture verification")
+	fmt.Println("  -verify-ping")
+	fmt.Println("        Enable ping verification after wake")
+	fmt.Println()
+	fmt.Println("Network Commands:")
+	fmt.Println("  verify-network")
+	fmt.Println("        Show network information and test connectivity")
+	fmt.Println("  test-broadcast <mac>")
+	fmt.Println("        Test broadcast capability with packet verification")
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  -port int")
