@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	wol_log "wol-server/wol/log"
 	wol_network "wol-server/wol/network"
 	wol_packet "wol-server/wol/packet"
+	wol_server "wol-server/wol/server"
 )
 
 func main() {
@@ -21,6 +23,10 @@ func main() {
 		verbose    = flag.Bool("verbose", false, "Enable verbose output (same as -level debug)")
 		quiet      = flag.Bool("quiet", false, "Quiet mode - only errors (same as -level error)")
 		configPath = flag.String("config", "", "Device configuration file path (default: system config directory)")
+		serverMode = flag.Bool("server", false, "Run in server mode")
+		serverPort = flag.Int("server-port", 8080, "Server port (default: 8080)")
+		serverHost = flag.String("server-host", "0.0.0.0", "Server host (default: 0.0.0.0)")
+		enableCORS = flag.Bool("cors", true, "Enable CORS headers (default: true)")
 	)
 
 	flag.Parse()
@@ -46,9 +52,14 @@ func main() {
 
 	deviceStore, err := wol_device.NewDeviceStore(deviceConfig)
 	if err != nil {
-		fmt.Print("Error setting up device store: %v\n", err)
+		fmt.Printf("Error setting up device store: %v\n", err)
 		logger.Error("Failed to initialize device store: %v", err)
 		os.Exit(1)
+	}
+
+	if *serverMode {
+		runServer(deviceStore, logger, *serverHost, *serverPort, *enableCORS)
+		return
 	}
 
 	args := flag.Args()
@@ -79,6 +90,28 @@ func main() {
 	default:
 		// Assume it's a device name or MAC address for wake-up
 		handleWake(command, *port, deviceStore, logger)
+	}
+}
+
+func runServer(deviceStore *wol_device.DeviceStore, logger *wol_log.Logger, host string, port int, cors bool) {
+	wol_network.SetLogger(logger)
+
+	config := wol_server.ServerConfig{
+		Port:        port,
+		Host:        host,
+		DeviceStore: deviceStore,
+		Logger:      logger,
+		EnableCORS:  cors,
+	}
+
+	server := wol_server.NewWoLServer(config)
+
+	logger.Info("WoL Server starting in HTTP server mode on %s:%d", host, port)
+
+	err := server.Start()
+	if err != nil && err != http.ErrServerClosed {
+		logger.Error("Server failed: %v", err)
+		os.Exit(1)
 	}
 }
 
@@ -322,23 +355,58 @@ func setupLogging(logFile, logLevel string, verbose, quiet bool) (*wol_log.Logge
 }
 
 func showHelp() {
-	fmt.Println("Wake-on-LAN Server")
-	fmt.Println("==================")
+	fmt.Println("Wake-on-LAN Server with Device Management")
+	fmt.Println("========================================")
 	fmt.Println()
 	fmt.Println("Send Wake-on-LAN magic packets to wake up sleeping computers on your network.")
+	fmt.Println("Manage devices with friendly names for easy access.")
 	fmt.Println()
 	showUsage()
+	fmt.Println()
+	fmt.Println("Device Management Commands:")
+	fmt.Println("  add-device <name> <mac> [desc] [ip] [port]")
+	fmt.Println("        Add a new device to the configuration")
+	fmt.Println("  list-devices")
+	fmt.Println("        List all configured devices")
+	fmt.Println("  remove-device <name>")
+	fmt.Println("        Remove a device from the configuration")
+	fmt.Println("  show-device <name>")
+	fmt.Println("        Show detailed information about a device")
+	fmt.Println()
+	fmt.Println("Wake Commands:")
+	fmt.Println("  wake <name-or-mac>")
+	fmt.Println("        Wake a device by name or MAC address")
+	fmt.Println("  <name-or-mac>")
+	fmt.Println("        Wake a device (shorthand)")
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  -port int")
 	fmt.Printf("        UDP port to send Wake-on-LAN packet (default: %d)\n", wol_network.DefaultWoLPort)
+	fmt.Println("  -config string")
+	fmt.Println("        Device configuration file path")
+	fmt.Println("  -log string")
+	fmt.Println("        Log file path (default: console only)")
+	fmt.Println("  -level string")
+	fmt.Println("        Log level: debug, info, warn, error (default: info)")
+	fmt.Println("  -verbose")
+	fmt.Println("        Enable verbose output (same as -level debug)")
+	fmt.Println("  -quiet")
+	fmt.Println("        Quiet mode - only errors (same as -level error)")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help message")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  wol-server AA:BB:CC:DD:EE:FF")
-	fmt.Println("  wol-server -port 7 AA-BB-CC-DD-EE-FF")
-	fmt.Println("  wol-server AABBCCDDEEFF")
+	fmt.Println("  # Device management")
+	fmt.Println("  wol-server.exe add-device desktop AA:BB:CC:DD:EE:FF \"My desktop computer\"")
+	fmt.Println("  wol-server.exe list-devices")
+	fmt.Println("  wol-server.exe show-device desktop")
+	fmt.Println("  wol-server.exe remove-device desktop")
+	fmt.Println()
+	fmt.Println("  # Wake devices")
+	fmt.Println("  wol-server.exe wake desktop")
+	fmt.Println("  wol-server.exe desktop")
+	fmt.Println("  wol-server.exe AA:BB:CC:DD:EE:FF")
+	fmt.Println("  wol-server.exe -port 7 laptop")
 	fmt.Println()
 	fmt.Println("Supported MAC address formats:")
 	fmt.Println("  - Colon separated: AA:BB:CC:DD:EE:FF")
@@ -349,5 +417,6 @@ func showHelp() {
 
 func showUsage() {
 	fmt.Println("Usage:")
-	fmt.Println("  wol-server [options] <MAC-address>")
+	fmt.Println("  wol-server.exe [options] <command> [arguments]")
+	fmt.Println("  wol-server.exe [options] <device-name-or-mac>")
 }

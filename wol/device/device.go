@@ -56,7 +56,7 @@ func (ds *DeviceStore) AddDevice(name, macAddress, description, ipAddress string
 		return fmt.Errorf("device name cannot be empty")
 	}
 
-	reservedNames := []string{"add-device", "list-device", "remove-device", "show-device", "wake", "help"}
+	reservedNames := []string{"add-device", "list-devices", "remove-device", "show-device", "wake", "help"}
 	for _, reserved := range reservedNames {
 		if strings.ToLower(name) == reserved {
 			return fmt.Errorf("device name '%s' is reserved", name)
